@@ -156,6 +156,21 @@ class JMConfigManager:
         return self.plugin_config.get("daily_download_limit", 0)
 
     @property
+    def jm_skill_enabled(self) -> bool:
+        """是否启用 JM LLM skill"""
+        return self.plugin_config.get("jm_skill_enabled", True)
+
+    @property
+    def jm_skill_max_results(self) -> int:
+        """JM LLM skill 单次最大返回数量"""
+        max_results = self.plugin_config.get("jm_skill_max_results", 5)
+        try:
+            max_results = int(max_results)
+        except (TypeError, ValueError):
+            max_results = 5
+        return max(1, min(20, max_results))
+
+    @property
     def cookies_file(self) -> Path:
         """Cookies文件路径"""
         return self.data_dir / "cookies.json"

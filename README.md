@@ -42,6 +42,7 @@ JM-Cosmos II 是一个基于 AstrBot 开发的 JM 漫画下载插件，支持漫
 - **漫画搜索** - 通过关键词搜索 JM 漫画
 - **漫画详情** - 查看漫画信息、标签、作者等
 - **本子下载** - 下载完整本子（/jm）或单章节（/jmc）
+- **LLM Skill** - 让 Bot 可自主调用 JM 搜索、详情、推荐和排行榜工具
 - **自动打包** - 下载完成后自动打包为 ZIP 或 PDF
 - **加密保护** - 支持为 ZIP/PDF 设置密码加密
 - **自动发送** - 打包后自动发送文件到聊天
@@ -264,7 +265,27 @@ pip install -r requirements.txt
 | `jm_password`            | JM账号密码                 | 空             | 命令登录重启后失效 |
 | `search_page_size`       | 搜索结果数量               | `5`            |  |
 | `daily_download_limit`   | 每日下载限制               | `0`            | 0=不限，管理员豁免 |
+| `jm_skill_enabled`       | 启用 JM LLM Skill          | `true`         | 允许 LLM 自主调用 JM 工具 |
+| `jm_skill_max_results`   | JM Skill 最大返回数量      | `5`            | 范围 1-20 |
 | `debug_mode`             | 调试模式                   | `false`        |  |
+
+## LLM Skill
+
+开启 `jm_skill_enabled` 后，Bot 在普通对话中可以自主决定是否调用 JM 工具：
+
+- `jm_search_albums`：按关键词搜索本子
+- `jm_get_album_detail`：查看指定 ID 详情
+- `jm_download_album`：用户明确要求下载时，下载并发送指定 ID
+- `jm_recommend_albums`：按分类、排序、时间浏览推荐
+- `jm_ranking_albums`：查看日/周/月排行榜
+
+`jm_search_albums` 会提示 LLM 尽可能使用标签搜索，且标签最多不超过两个。多标签语法：
+
+- `标签1 +标签2`：交集，同时包含两个标签
+- `标签1 -标签2`：排除，包含标签1但不包含标签2
+- `标签1 标签2`：并集，包含任一标签
+
+搜索、详情、推荐和排行榜工具只返回信息，不会自动下载文件。用户明确要求下载时，LLM 可直接调用 `jm_download_album`，无需借助其他插件执行 `/jm <ID>`。
 
 ## 文件结构
 

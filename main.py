@@ -4,11 +4,12 @@ JM-Cosmos II - AstrBot JM漫画下载插件
 支持搜索、下载禁漫天堂的漫画本子，基于jmcomic库
 """
 
+import json
 from pathlib import Path
 
 import astrbot.api.message_components as Comp
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
 from .core import (
@@ -92,6 +93,139 @@ class JMCosmosPlugin(Star):
             return False, MessageFormatter.format_error("group_disabled")
 
         return True, ""
+
+    def _check_skill_permission(self, event: AstrMessageEvent) -> tuple[bool, str]:
+        """检查 LLM 工具是否允许在当前会话使用"""
+        if not self.config_manager.jm_skill_enabled:
+            return False, "JM skill 已在配置中关闭"
+        return self._check_permission(event)
+
+    def _tool_json(self, payload: dict) -> str:
+        """返回 LLM 友好的 JSON 文本"""
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
+    def _normalize_tool_limit(self, limit: int | str | None = None) -> int:
+        """规范化 LLM 工具返回数量"""
+        try:
+            value = int(limit) if limit is not None else self.config_manager.search_page_size
+        except (TypeError, ValueError):
+            value = self.config_manager.search_page_size
+        return max(1, min(self.config_manager.jm_skill_max_results, value))
+
+    def _normalize_search_keyword(self, keyword: str) -> str:
+        """规范化 LLM 传入的搜索关键词，优先保留 JM 标签搜索语法"""
+        keyword = str(keyword or "").strip()
+        if not keyword:
+            return ""
+
+        # LLM 偶尔会用中文/英文逗号列多个标签；JM 标签并集搜索使用空格分隔。
+        for separator in ("，", ",", "、"):
+            keyword = keyword.replace(separator, " ")
+
+        parts = keyword.split()
+        if len(parts) <= 2:
+            return " ".join(parts)
+
+        # 标签搜索约定最多两个标签；保留第一个标签和第一个带 +/- 的约束标签。
+        constrained = next((part for part in parts[1:] if part[:1] in {"+", "-"}), None)
+        if constrained:
+            return f"{parts[0]} {constrained}"
+        return " ".join(parts[:2])
+
+    async def _send_message_chain(self, event: AstrMessageEvent, chain: MessageChain):
+        """向当前会话发送消息链"""
+        await self.context.send_message(event.unified_msg_origin, chain)
+
+    async def _download_album_for_skill(
+        self, event: AstrMessageEvent, album_id: str
+    ) -> dict:
+        """供 LLM tool 使用的本子下载流程"""
+        user_id = event.get_sender_id()
+        limit = self.config_manager.daily_download_limit
+        is_admin = str(user_id) in self.config_manager.admin_list
+
+        if limit > 0 and not is_admin:
+            can_download, used, total = self.quota_manager.check_quota(user_id, limit)
+            if not can_download:
+                return {
+                    "success": False,
+                    "message": f"今日下载次数已达上限 ({used}/{total})",
+                }
+
+        await self._send_message_chain(
+            event, MessageChain([Comp.Plain(f"⏳ 开始下载本子 {album_id}，请稍候...")])
+        )
+
+        result = await self.download_manager.download_album(album_id)
+        if not result.success:
+            return {
+                "success": False,
+                "message": MessageFormatter.format_error(
+                    "download_failed", result.error_message
+                ),
+            }
+
+        output_name = generate_album_filename(
+            album_id=album_id,
+            password=self.config_manager.pack_password,
+            show_password=self.config_manager.filename_show_password,
+        )
+
+        packer = JMPacker(
+            pack_format=self.config_manager.pack_format,
+            password=self.config_manager.pack_password,
+        )
+        pack_result = packer.pack(
+            source_dir=result.save_path,
+            output_name=output_name,
+        )
+
+        if limit > 0:
+            self.quota_manager.consume_quota(user_id)
+
+        result_msg = MessageFormatter.format_download_result(result, pack_result)
+
+        sent_file = False
+        if (
+            pack_result.success
+            and pack_result.output_path
+            and pack_result.format != "none"
+        ):
+            file_chain = MessageChain(
+                [
+                    Comp.Plain(result_msg),
+                    Comp.File(
+                        name=pack_result.output_path.name,
+                        file=str(pack_result.output_path),
+                    ),
+                ]
+            )
+
+            if self.config_manager.auto_recall_enabled:
+                await send_with_recall(
+                    event,
+                    file_chain,
+                    self.config_manager.auto_recall_delay,
+                )
+            else:
+                await self._send_message_chain(event, file_chain)
+
+            sent_file = True
+
+            if self.config_manager.auto_delete_after_send:
+                JMPacker.cleanup(result.save_path)
+                JMPacker.cleanup(pack_result.output_path)
+        else:
+            await self._send_message_chain(event, MessageChain([Comp.Plain(result_msg)]))
+
+        return {
+            "success": True,
+            "message": "下载完成，已发送到当前会话" if sent_file else "下载完成",
+            "album_id": album_id,
+            "title": result.title,
+            "pack_format": pack_result.format if pack_result else None,
+            "sent_file": sent_file,
+        }
 
     @filter.command("jmhelp")
     async def help_command(self, event: AstrMessageEvent):
@@ -467,6 +601,251 @@ class JMCosmosPlugin(Star):
         except Exception as e:
             logger.error(f"搜索失败: {e}")
             yield event.plain_result(MessageFormatter.format_error("network", str(e)))
+
+    @filter.llm_tool(name="jm_search_albums")
+    async def jm_search_albums_tool(
+        self,
+        event: AstrMessageEvent,
+        keyword: str,
+        page: int = 1,
+        limit: int = None,
+    ) -> str:
+        """搜索 JM 本子，优先使用标签进行搜索。
+
+        当用户自然语言表达想找、推荐、检索某类本子/漫画/标签/作者/题材时，模型可以自主调用本工具。
+        尽可能把用户需求转成标签关键词再搜索。
+        标签最多不超过两个。多标签格式:
+        - "标签1 +标签2": 交集，同时包含两个标签
+        - "标签1 -标签2": 排除，包含标签1但不包含标签2
+        - "标签1 标签2": 并集，包含任一标签
+        本工具只返回搜索结果和可用于后续查看/下载的 ID，不会自动下载或发送文件。
+
+        Args:
+            keyword(string): 搜索关键词，优先传标签表达式；也可以是作者、标题或题材。
+            page(number): 搜索页码，默认 1。
+            limit(number): 返回数量，默认使用插件搜索页大小，最大受配置限制。
+        """
+        has_perm, error_msg = self._check_skill_permission(event)
+        if not has_perm:
+            return self._tool_json({"success": False, "message": error_msg})
+
+        keyword = self._normalize_search_keyword(keyword)
+        if not keyword:
+            return self._tool_json({"success": False, "message": "缺少关键词 keyword"})
+
+        try:
+            page = max(1, int(page))
+        except (TypeError, ValueError):
+            page = 1
+        limit = self._normalize_tool_limit(limit)
+
+        try:
+            results = await self.browser.search_albums(keyword, page)
+            results = results[:limit]
+            return self._tool_json(
+                {
+                    "success": True,
+                    "keyword": keyword,
+                    "page": page,
+                    "count": len(results),
+                    "results": results,
+                    "usage_hint": "可用 /jmi <ID> 查看详情，或 /jm <ID> 下载。",
+                }
+            )
+        except Exception as e:
+            logger.error(f"LLM 搜索本子失败: {e}")
+            return self._tool_json({"success": False, "message": str(e)})
+
+    @filter.llm_tool(name="jm_get_album_detail")
+    async def jm_get_album_detail_tool(
+        self, event: AstrMessageEvent, album_id: str
+    ) -> str:
+        """获取 JM 本子详情。
+
+        当模型已经从搜索、排行、推荐或用户输入中得到本子 ID，并需要确认标题、标签、作者、章节数等信息时调用。
+        本工具不会下载本子。
+
+        Args:
+            album_id(string): 本子 ID，纯数字。
+        """
+        has_perm, error_msg = self._check_skill_permission(event)
+        if not has_perm:
+            return self._tool_json({"success": False, "message": error_msg})
+
+        album_id = str(album_id or "").strip()
+        if not album_id.isdigit():
+            return self._tool_json({"success": False, "message": "album_id 必须是纯数字"})
+
+        try:
+            detail = await self.browser.get_album_detail(album_id)
+            if not detail:
+                return self._tool_json({"success": False, "message": "未找到本子"})
+            return self._tool_json(
+                {
+                    "success": True,
+                    "album": detail,
+                    "usage_hint": "用户明确要下载时，可提示使用 /jm <ID>。",
+                }
+            )
+        except Exception as e:
+            logger.error(f"LLM 获取本子详情失败: {e}")
+            return self._tool_json({"success": False, "message": str(e)})
+
+    @filter.llm_tool(name="jm_download_album")
+    async def jm_download_album_tool(
+        self, event: AstrMessageEvent, album_id: str
+    ) -> str:
+        """下载并发送指定 JM 本子。
+
+        仅当用户明确表达“下载这个本子/发这个本子/下 ID 为 xxx 的本子”时调用本工具。
+        不要通过 execute_command 执行 "/jm <ID>"；需要下载时直接调用本工具。
+        如果用户只是想搜索、看看详情、找推荐，不要调用本工具。
+
+        Args:
+            album_id(string): 要下载的本子 ID，纯数字。
+        """
+        has_perm, error_msg = self._check_skill_permission(event)
+        if not has_perm:
+            return self._tool_json({"success": False, "message": error_msg})
+
+        album_id = str(album_id or "").strip()
+        if not album_id.isdigit():
+            return self._tool_json({"success": False, "message": "album_id 必须是纯数字"})
+
+        try:
+            return self._tool_json(await self._download_album_for_skill(event, album_id))
+        except Exception as e:
+            logger.error(f"LLM 下载本子失败: {e}")
+            if self.debug_mode:
+                import traceback
+
+                logger.error(traceback.format_exc())
+            return self._tool_json({"success": False, "message": str(e)})
+
+    @filter.llm_tool(name="jm_recommend_albums")
+    async def jm_recommend_albums_tool(
+        self,
+        event: AstrMessageEvent,
+        category: str = "all",
+        order_by: str = "hot",
+        time_range: str = "week",
+        page: int = 1,
+        limit: int = None,
+    ) -> str:
+        """按分类、排序和时间获取 JM 推荐/浏览结果。
+
+        当用户没有给出明确关键词，只是想让 bot 自主找一些热门、最新、某分类本子时调用。
+        可选分类: all, doujin, single, short, hanman, meiman, 3d, cosplay, another。
+        可选排序: hot, new, pic, like。
+        可选时间: day, week, month, all。
+
+        Args:
+            category(string): 分类，默认 all。
+            order_by(string): 排序，默认 hot。
+            time_range(string): 时间范围，默认 week。
+            page(number): 页码，默认 1。
+            limit(number): 返回数量，默认使用插件搜索页大小，最大受配置限制。
+        """
+        has_perm, error_msg = self._check_skill_permission(event)
+        if not has_perm:
+            return self._tool_json({"success": False, "message": error_msg})
+
+        from .core.browser import JMBrowser
+
+        category = str(category or "all").lower().strip()
+        order_by = str(order_by or "hot").lower().strip()
+        time_range = str(time_range or "week").lower().strip()
+
+        if category not in JMBrowser.get_category_list():
+            category = "all"
+        if order_by not in JMBrowser.get_order_list():
+            order_by = "hot"
+        if time_range not in JMBrowser.get_time_list():
+            time_range = "week"
+
+        try:
+            page = max(1, int(page))
+        except (TypeError, ValueError):
+            page = 1
+        limit = self._normalize_tool_limit(limit)
+
+        try:
+            results = await self.browser.get_category_albums(
+                category=category,
+                order_by=order_by,
+                time_range=time_range,
+                page=page,
+            )
+            results = results[:limit]
+            return self._tool_json(
+                {
+                    "success": True,
+                    "category": category,
+                    "order_by": order_by,
+                    "time_range": time_range,
+                    "page": page,
+                    "count": len(results),
+                    "results": results,
+                    "usage_hint": "可用 jm_get_album_detail 进一步查看某个 ID。",
+                }
+            )
+        except Exception as e:
+            logger.error(f"LLM 获取推荐本子失败: {e}")
+            return self._tool_json({"success": False, "message": str(e)})
+
+    @filter.llm_tool(name="jm_ranking_albums")
+    async def jm_ranking_albums_tool(
+        self,
+        event: AstrMessageEvent,
+        ranking_type: str = "week",
+        page: int = 1,
+        limit: int = None,
+    ) -> str:
+        """获取 JM 日/周/月排行榜。
+
+        当用户想看热门、排行榜、最近大家在看的本子时调用。
+        可选 ranking_type: day, week, month。
+
+        Args:
+            ranking_type(string): 排行榜类型，day/week/month，默认 week。
+            page(number): 页码，默认 1。
+            limit(number): 返回数量，默认使用插件搜索页大小，最大受配置限制。
+        """
+        has_perm, error_msg = self._check_skill_permission(event)
+        if not has_perm:
+            return self._tool_json({"success": False, "message": error_msg})
+
+        ranking_type = str(ranking_type or "week").lower().strip()
+        if ranking_type not in ("day", "week", "month"):
+            ranking_type = "week"
+        try:
+            page = max(1, int(page))
+        except (TypeError, ValueError):
+            page = 1
+        limit = self._normalize_tool_limit(limit)
+
+        try:
+            if ranking_type == "day":
+                results = await self.browser.get_day_ranking(page)
+            elif ranking_type == "month":
+                results = await self.browser.get_month_ranking(page)
+            else:
+                results = await self.browser.get_week_ranking(page)
+
+            results = results[:limit]
+            return self._tool_json(
+                {
+                    "success": True,
+                    "ranking_type": ranking_type,
+                    "page": page,
+                    "count": len(results),
+                    "results": results,
+                    "usage_hint": "可用 jm_get_album_detail 进一步查看某个 ID。",
+                }
+            )
+        except Exception as e:
+            logger.error(f"LLM 获取排行榜失败: {e}")
+            return self._tool_json({"success": False, "message": str(e)})
 
     @filter.command("jmi")
     async def info_command(self, event: AstrMessageEvent, album_id: str = None):

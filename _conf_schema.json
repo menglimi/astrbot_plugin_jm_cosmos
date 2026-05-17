@@ -145,6 +145,18 @@
     "hint": "每个用户每天最多下载次数，0 表示不限制",
     "default": 0
   },
+  "jm_skill_enabled": {
+    "type": "bool",
+    "description": "启用 JM LLM Skill",
+    "hint": "开启后，LLM 可自主调用 JM 搜索、详情、推荐和排行榜工具",
+    "default": true
+  },
+  "jm_skill_max_results": {
+    "type": "int",
+    "description": "JM Skill 最大返回数量",
+    "hint": "LLM 每次调用搜索/推荐/排行工具最多返回多少条结果，范围 1-20",
+    "default": 5
+  },
   "debug_mode": {
     "type": "bool",
     "description": "调试模式",
