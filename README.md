@@ -4,6 +4,8 @@
 
 # <div align="center">JM-Cosmos II</div>
 
+> **群聊通知（2026-10-11）：** 原群聊被停用一周，期间可先加入 bot 群：**145326153**。
+
 <div align="center">
   <strong>全能型 JM 漫画下载与管理工具</strong>
 </div>
